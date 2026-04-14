@@ -20,9 +20,9 @@ export function designerPicker(mode) {
   document.documentElement.appendChild(style);
 
   const hintMsg = {
-    element: "Click any element to select — Esc to cancel",
+    element: "Click to select — Cmd/Shift-click adds more — Enter to finish — Esc cancels",
     area: "Drag to select an area — Esc to cancel",
-    draw: "Draw with the pen — Enter to finish, Esc to cancel",
+    draw: "Draw with the pen — ⌘Z undo — type to label — Enter to finish — Esc cancels",
   }[mode] || "Select — Esc to cancel";
   const hint = document.createElement("div");
   hint.id = "__designer-hint";
@@ -56,16 +56,39 @@ export function designerPicker(mode) {
     const key = Object.keys(node).find((k) => k.startsWith("__reactFiber$"));
     if (!key) return null;
     let fiber = node[key];
+    let firstComponentName = null;
+    let componentChain = [];
     while (fiber) {
+      // Prefer _debugSource (dev builds only).
       if (fiber._debugSource) {
         return {
           fileName: fiber._debugSource.fileName,
           lineNumber: fiber._debugSource.lineNumber,
           columnNumber: fiber._debugSource.columnNumber || null,
           componentName: (fiber.type && (fiber.type.displayName || fiber.type.name)) || null,
+          componentChain,
+          hint: "dev-source",
         };
       }
+      // Fallback: collect function-component names for grep targeting in prod.
+      if (typeof fiber.type === "function") {
+        const n = fiber.type.displayName || fiber.type.name;
+        if (n && n[0] !== "_") {
+          if (!firstComponentName) firstComponentName = n;
+          if (componentChain.length < 5 && !componentChain.includes(n)) componentChain.push(n);
+        }
+      }
       fiber = fiber.return;
+    }
+    if (firstComponentName) {
+      return {
+        fileName: null,
+        lineNumber: null,
+        columnNumber: null,
+        componentName: firstComponentName,
+        componentChain,
+        hint: "prod-fallback — grep the codebase for componentName or componentChain to locate source",
+      };
     }
     return null;
   };
@@ -102,17 +125,47 @@ export function designerPicker(mode) {
 
   if (mode === "element") {
     let hovered = null;
+    const picked = [];
     const setHover = (el) => {
       if (hovered) hovered.classList.remove("__designer-hover");
       hovered = el;
       if (el && el instanceof Element) el.classList.add("__designer-hover");
     };
+    const markPicked = (el) => {
+      el.style.outline = "2px solid #16a34a";
+      el.style.outlineOffset = "2px";
+      el.dataset.__designerPicked = "1";
+    };
+    const finish = () => {
+      cleanup();
+      if (picked.length === 1) {
+        const el = picked[0];
+        const info = describe(el);
+        window.__designerResult = { mode: "element", ...info, html: el.outerHTML.slice(0, 2000) };
+      } else {
+        window.__designerResult = {
+          mode: "element",
+          elements: picked.map((el) => ({ ...describe(el), html: el.outerHTML.slice(0, 800) })),
+        };
+      }
+    };
     on(document, "mousemove", (e) => setHover(e.target));
     on(document, "click", (e) => {
       e.preventDefault(); e.stopPropagation();
       const el = e.target;
-      cleanup();
-      window.__designerResult = { mode: "element", ...describe(el), html: el.outerHTML.slice(0, 2000) };
+      if (e.metaKey || e.shiftKey) {
+        // Accumulate — don't finish yet.
+        if (!picked.includes(el)) { picked.push(el); markPicked(el); }
+      } else {
+        picked.push(el);
+        finish();
+      }
+    });
+    on(document, "keydown", (e) => {
+      if (e.key === "Enter" && picked.length > 0) {
+        e.preventDefault();
+        finish();
+      }
     });
   }
 
@@ -187,9 +240,40 @@ export function designerPicker(mode) {
     ctx.lineJoin = "round";
     document.body.appendChild(canvas);
 
+    // Label input — floats next to hint, focusable without stealing canvas pointer events.
+    const label = document.createElement("input");
+    label.type = "text";
+    label.id = "__designer-label";
+    label.placeholder = "optional label — e.g. 'too tight' or 'move right'";
+    Object.assign(label.style, {
+      position: "fixed", top: "44px", left: "50%", transform: "translateX(-50%)",
+      zIndex: "2147483647", padding: "6px 10px", borderRadius: "6px",
+      border: "1px solid #555", background: "rgba(255,255,255,0.95)", color: "#111",
+      font: "12px -apple-system, sans-serif", width: "340px",
+      boxShadow: "0 4px 20px rgba(0,0,0,.2)",
+    });
+    document.body.appendChild(label);
+    // Don't let typing in the label trigger our document keydown listeners,
+    // EXCEPT Enter (finish) and Escape (cancel) which should always bubble.
+    label.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== "Escape") e.stopPropagation();
+    }, true);
+
     const strokes = [];
     let currentStroke = null;
     let drawing = false;
+
+    const redraw = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      for (const stroke of strokes) {
+        if (stroke.length < 2) continue;
+        ctx.beginPath();
+        ctx.moveTo(stroke[0][0], stroke[0][1]);
+        for (let i = 1; i < stroke.length; i++) ctx.lineTo(stroke[i][0], stroke[i][1]);
+        ctx.stroke();
+      }
+    };
+
     on(canvas, "mousedown", (e) => {
       drawing = true;
       currentStroke = [[Math.round(e.clientX), Math.round(e.clientY)]];
@@ -209,13 +293,28 @@ export function designerPicker(mode) {
       currentStroke = null;
     });
     on(document, "keydown", (e) => {
+      // Let typing in the label only pass Enter/Escape up to us.
+      if (e.target === label && e.key !== "Enter" && e.key !== "Escape") return;
+      // Undo last stroke
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (strokes.length > 0) {
+          strokes.pop();
+          redraw();
+        }
+        return;
+      }
       if (e.key === "Enter") {
         e.preventDefault();
+        // Remove label from DOM before screenshotting so it doesn't appear in the capture.
+        const note = label.value.trim() || null;
+        label.remove();
         window.__designerDrawCanvasData = canvas.toDataURL("image/png");
         cleanup();
         window.__designerResult = {
           mode: "draw",
           strokes,
+          note,
           viewport: { w: window.innerWidth, h: window.innerHeight },
         };
       }

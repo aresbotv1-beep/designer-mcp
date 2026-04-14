@@ -87,6 +87,30 @@ async function designerScreenshot(selector) {
   return { path, bytes: buf.length };
 }
 
+async function designerVerify({ selector, before_path = null, wait_ms = 1500 }) {
+  if (!selector) throw new Error("designer_verify requires { selector }");
+  if (!page || page.isClosed()) throw new Error("No active page. Call designer_open first.");
+  // Give HMR or deploy time to apply.
+  await new Promise((r) => setTimeout(r, Math.max(0, Math.min(wait_ms, 30000))));
+  const el = await page.$(selector);
+  if (!el) throw new Error(`Selector not found after wait: ${selector}`);
+  const afterBuf = await el.screenshot();
+  const after_path = saveScreenshot(afterBuf, "verify-after");
+  const result = { selector, before_path, after_path, after_bytes: afterBuf.length };
+  if (before_path) {
+    try {
+      const { statSync, readFileSync } = await import("node:fs");
+      const beforeBuf = readFileSync(before_path);
+      result.before_bytes = beforeBuf.length;
+      // Cheap "did it change" heuristic: identical bytes means unchanged.
+      result.changed = beforeBuf.length !== afterBuf.length || !beforeBuf.equals(afterBuf);
+    } catch (err) {
+      result.compare_error = err.message;
+    }
+  }
+  return result;
+}
+
 async function designerClose() {
   if (browser) await browser.close().catch(() => {});
   browser = context = page = null;
@@ -155,7 +179,7 @@ async function designerPick(mode = "element") {
 }
 
 const server = new Server(
-  { name: "designer-mcp", version: "0.1.0" },
+  { name: "designer-mcp", version: "0.2.0" },
   { capabilities: { tools: {} } },
 );
 
@@ -191,6 +215,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "designer_verify",
+      description:
+        "After editing code based on a pick, call this to compare before/after. Waits briefly for HMR/deploy (default 1500ms), screenshots the same selector, returns { before_path, after_path, changed }. Pass the pick's screenshot_path as before_path to enable the change check.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: { type: "string", description: "CSS selector from a prior pick" },
+          before_path: { type: "string", description: "The pick's screenshot_path" },
+          wait_ms: { type: "number", description: "Milliseconds to wait before capturing (default 1500, max 30000)" },
+        },
+        required: ["selector"],
+      },
+    },
+    {
       name: "designer_screenshot",
       description:
         "Screenshot the current page or a specific element selector. Returns { path, bytes } — a filesystem path to a PNG in /tmp that you can Read with the Read tool.",
@@ -214,6 +252,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === "designer_open") result = await designerOpen(args.url);
     else if (name === "designer_pick") result = await designerPick(args.mode);
     else if (name === "designer_screenshot") result = await designerScreenshot(args.selector);
+    else if (name === "designer_verify") result = await designerVerify(args);
     else if (name === "designer_close") result = await designerClose();
     else throw new Error(`Unknown tool: ${name}`);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };

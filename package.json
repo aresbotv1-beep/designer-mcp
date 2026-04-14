@@ -1,7 +1,7 @@
 {
   "name": "designer-mcp",
-  "version": "0.1.0",
-  "description": "Click-to-select element picker for Claude Code — returns source file:line + screenshot for any DOM node in a headed browser",
+  "version": "0.2.0",
+  "description": "Click-to-select element picker for Claude Code \u2014 returns source file:line + screenshot for any DOM node in a headed browser",
   "type": "module",
   "bin": {
     "designer-mcp": "./index.js"
